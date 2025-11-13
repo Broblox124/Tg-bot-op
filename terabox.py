@@ -15,7 +15,6 @@ from urllib.parse import urlparse
 from flask import Flask, render_template
 from threading import Thread
 
-load_dotenv('config.env', override=True)
 logging.basicConfig(
     level=logging.INFO,  
     format="[%(asctime)s - %(name)s - %(levelname)s] %(message)s - %(filename)s:%(lineno)d"
