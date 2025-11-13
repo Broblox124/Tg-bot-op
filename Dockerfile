@@ -2,6 +2,8 @@
 FROM python:3.10-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
+# show python output immediately in logs
+ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
 # Install system deps including aria2
@@ -24,8 +26,15 @@ RUN if [ -f /app/requirements.txt ]; then python -m pip install --no-cache-dir -
 # Copy application files
 COPY . /app
 
-# Ensure start script is executable
-RUN chmod +x /app/start.sh
+# Create .venv symlink so start.sh (which expects .venv) works unchanged
+RUN ln -s /opt/venv /app/.venv || true
 
-# Default command
-CMD ["bash", "/app/start.sh"]
+# Ensure scripts are executable
+RUN chmod +x /app/start.sh /app/env_builder.sh || true
+
+# (Optional) Create a non-root user for better security (uncomment if you want)
+# RUN useradd -m -s /bin/bash appuser && chown -R appuser:appuser /app
+# USER appuser
+
+# Default command: run our env builder which will create config.env then exec start.sh
+CMD ["bash", "/app/env_builder.sh"]
