@@ -348,48 +348,41 @@ async def safe_edit(message, text):
         logger.error(f"Failed to update status message: {e}")
 
 
-# ---------- Filename cleaning (fix .mp4.mkv etc.) ----------
-
-VIDEO_EXTS = [".mp4", ".mkv", ".webm", ".mov", ".avi"]
-
+# ---------- Filename cleaning (fix .mp4.mkv etc. WITHOUT changing real ext) ----------
 
 def clean_download_name(path_or_name: str) -> str:
     """
     Normalize filename:
     - strip query params
     - decode URL encoding
-    - fix double-extension cases like *.mp4.mkv so final ext is original (.mkv)
-    - DO NOT force .mp4; keep original extension (e.g. .mkv)
+    - fix double-extension cases like *.mp4.mkv or *.mkv.mp4
+      by keeping the *inner/first* extension (assumed original)
+      e.g.  VID_123.mp4.mkv -> VID_123.mp4
+            movie.mkv.mp4   -> movie.mkv
+    - DO NOT force-convert extensions (.mkv stays .mkv, .mp4 stays .mp4, etc.)
     """
     name = os.path.basename(path_or_name)
-    # remove query
+    # remove query part
     name = name.split("?", 1)[0]
     # URL decode
     name = unquote(name)
 
-    # If path inside name, reduce to final segment
+    # If path appears inside, reduce to final segment
     if "/" in name:
         name = name.split("/")[-1]
 
-    # Aggressive double-extension fix:
-    # repeatedly remove any extra video extension BEFORE the last one
-    while True:
-        root, ext = os.path.splitext(name)
-        if ext.lower() not in VIDEO_EXTS:
-            break  # last ext is not a known video ext; nothing special
+    # Handle double extension:
+    base1, ext1 = os.path.splitext(name)      # last extension
+    base2, ext2 = os.path.splitext(base1)     # second-last extension
 
-        lowered_root = root.lower()
-        removed = False
-        for extra_ext in VIDEO_EXTS:
-            if lowered_root.endswith(extra_ext):
-                # remove inner extension
-                root = root[: -len(extra_ext)]
-                name = root + ext
-                removed = True
-                break
+    common_video_exts = {".mp4", ".mkv", ".webm", ".mov", ".avi"}
+    common_audio_exts = {".mp3", ".m4a", ".flac", ".wav"}
+    common_exts = common_video_exts | common_audio_exts
 
-        if not removed:
-            break
+    # If we see something like *.mp4.mkv or *.mkv.mp4 → keep the inner ext (ext2)
+    if ext1.lower() in common_exts and ext2.lower() in common_exts:
+        # Prefer the first/inner extension as the original one
+        name = base2 + ext2
 
     # Limit length to avoid Telegram issues
     if len(name) > 150:
@@ -572,7 +565,7 @@ async def handle_message(client: Client, message: Message):
 
     file_size = os.path.getsize(file_path)
 
-    # Normalize filename (fix .mp4.mkv etc., keep original extension e.g. .mkv)
+    # Normalize filename (fix .mp4.mkv etc., keep original extension e.g. .mkv or .mp4)
     file_path, display_name = normalize_download_path(file_path)
 
     caption = (
@@ -670,17 +663,12 @@ async def handle_message(client: Client, message: Message):
             raise
 
     async def send_file_to_dump_and_user(path, cap, part_info: str = ""):
-        """
-        Upload flow:
-        - Always use BOT (app) to send to DUMP_CHAT_ID (no user session issues).
-        - Copy from dump to user.
-        - If dump fails, send directly to user.
-        """
         full_caption = cap + (f"\n\n{part_info}" if part_info else "")
+        uploader = user if USER_SESSION_STRING else app
 
-        # 1) send to dump via BOT
+        # 1) send to dump
         try:
-            sent = await app.send_document(
+            sent = await uploader.send_video(
                 DUMP_CHAT_ID,
                 path,
                 caption=full_caption,
@@ -690,7 +678,7 @@ async def handle_message(client: Client, message: Message):
             logger.error(f"BadRequest while sending to dump chat {DUMP_CHAT_ID}: {e}")
             # fallback: send directly to user
             try:
-                await app.send_document(
+                await app.send_video(
                     message.chat.id,
                     path,
                     caption=full_caption,
@@ -712,7 +700,7 @@ async def handle_message(client: Client, message: Message):
                 logger.warning(f"Could not forward from dump to user: {e}")
                 # fallback: send again directly
                 try:
-                    await app.send_document(
+                    await app.send_video(
                         message.chat.id,
                         path,
                         caption=full_caption,
