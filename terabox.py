@@ -1,43 +1,47 @@
-# terabox.py (patched with MIN_CHAT_ID fix + safer uploads)
 from aria2p import API as Aria2API, Client as Aria2Client
 import asyncio
-from dotenv import load_dotenv
 from datetime import datetime
 import os
 import logging
 import math
-from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
-from pyrogram.enums import ChatMemberStatus
-from pyrogram.errors import FloodWait, BadRequest, RPCError
-from pyrogram import utils as py_utils  # <-- for MIN_CHAT_ID / MIN_CHANNEL_ID tweak
 import time
+import json
+import re
 import urllib.parse
 from urllib.parse import urlparse
+
+import requests
+from pyrogram import Client, filters, utils as pyro_utils
+from pyrogram.types import (
+    Message,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup
+)
+from pyrogram.enums import ChatMemberStatus
+from pyrogram.errors import FloodWait, BadRequest
 from flask import Flask, render_template
 from threading import Thread
-import requests
 
-# ---------- Pyrogram ID range fix ----------
-# Allow larger (more negative) IDs for chats/channels
-py_utils.MIN_CHAT_ID = -999999999999
-py_utils.MIN_CHANNEL_ID = -100999999999999
-
-# ---------- load env / logging ----------
-load_dotenv('config.env', override=True)
-
+# --------------------
+# Logging & Pyrogram limits patch
+# --------------------
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s - %(name)s - %(levelname)s] %(message)s - %(filename)s:%(lineno)d"
 )
-
 logger = logging.getLogger(__name__)
 
 logging.getLogger("pyrogram.session").setLevel(logging.ERROR)
 logging.getLogger("pyrogram.connection").setLevel(logging.ERROR)
 logging.getLogger("pyrogram.dispatcher").setLevel(logging.ERROR)
 
-# ---------- aria2 client ----------
+# Fix for big negative chat/channel IDs (your previous dev trick)
+pyro_utils.MIN_CHAT_ID = -999999999999
+pyro_utils.MIN_CHANNEL_ID = -100999999999999
+
+# --------------------
+# Aria2 config
+# --------------------
 aria2 = Aria2API(
     Aria2Client(
         host="http://localhost",
@@ -45,6 +49,7 @@ aria2 = Aria2API(
         secret=""
     )
 )
+
 options = {
     "max-tries": "50",
     "retry-wait": "3",
@@ -53,89 +58,98 @@ options = {
     "min-split-size": "4M",
     "split": "10"
 }
+aria2.set_global_options(options)
 
-try:
-    aria2.set_global_options(options)
-except Exception as e:
-    logger.warning(f"Could not set aria2 global options at startup: {e}")
-
-# ---------- env / config ----------
+# --------------------
+# Environment / config
+# --------------------
 API_ID = os.environ.get('TELEGRAM_API', '')
-if len(API_ID) == 0:
-    logging.error("TELEGRAM_API variable is missing! Exiting now")
+if not API_ID:
+    logger.error("TELEGRAM_API variable is missing! Exiting now")
     exit(1)
 
 API_HASH = os.environ.get('TELEGRAM_HASH', '')
-if len(API_HASH) == 0:
-    logging.error("TELEGRAM_HASH variable is missing! Exiting now")
+if not API_HASH:
+    logger.error("TELEGRAM_HASH variable is missing! Exiting now")
     exit(1)
 
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
-if len(BOT_TOKEN) == 0:
-    logging.error("BOT_TOKEN variable is missing! Exiting now")
+if not BOT_TOKEN:
+    logger.error("BOT_TOKEN variable is missing! Exiting now")
     exit(1)
 
 DUMP_CHAT_ID = os.environ.get('DUMP_CHAT_ID', '')
-if len(DUMP_CHAT_ID) == 0:
-    logging.error("DUMP_CHAT_ID variable is missing! Exiting now")
-    exit(1)
-# Try int cast; if it fails, we keep it as string (for @username)
-try:
-    DUMP_CHAT_ID = int(DUMP_CHAT_ID)
-except Exception:
-    pass
-
-FSUB_ID = os.environ.get('FSUB_ID', '')
-if len(FSUB_ID) == 0:
-    logging.error("FSUB_ID variable is missing! Exiting now")
+if not DUMP_CHAT_ID:
+    logger.error("DUMP_CHAT_ID variable is missing! Exiting now")
     exit(1)
 else:
-    try:
-        FSUB_ID = int(FSUB_ID)
-    except Exception:
-        logging.error("FSUP_ID must be an integer chat id.")
-        exit(1)
+    DUMP_CHAT_ID = int(DUMP_CHAT_ID)
+
+FSUB_ID = os.environ.get('FSUB_ID', '')
+if not FSUB_ID:
+    logger.error("FSUB_ID variable is missing! Exiting now")
+    exit(1)
+else:
+    FSUB_ID = int(FSUB_ID)
 
 USER_SESSION_STRING = os.environ.get('USER_SESSION_STRING', '')
-if len(USER_SESSION_STRING) == 0:
-    logging.info("USER_SESSION_STRING variable is missing! Bot will split Files in 2Gb...")
+if not USER_SESSION_STRING:
+    logger.info("USER_SESSION_STRING variable is missing! Bot will split files in ~2GB chunks...")
     USER_SESSION_STRING = None
 
-# Provide a configurable Terabox->direct link API endpoint (default boogafantastic)
-TERA_API = os.environ.get('TERA_API', 'https://teraapi.boogafantastic.workers.dev/')
+# Terabox API base (MiN3R / boogafantastic)
+TERA_API = os.environ.get(
+    "TERA_API",
+    "https://teraapi.boogafantastic.workers.dev"
+).rstrip("/")
 
+# --------------------
+# Pyrogram clients
+# --------------------
 app = Client("jetbot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# We will NOT use user session for sending (avoids PEER_ID_INVALID issues)
 user = None
-SPLIT_SIZE = 2093796556  # still used for splitting threshold
+SPLIT_SIZE = 2093796556  # ~2GB
+if USER_SESSION_STRING:
+    user = Client("jetu", api_id=API_ID, api_hash=API_HASH, session_string=USER_SESSION_STRING)
+    SPLIT_SIZE = 4241280205  # ~4GB
 
+# --------------------
+# Helpers / constants
+# --------------------
 VALID_DOMAINS = [
     'terabox.com', 'nephobox.com', '4funbox.com', 'mirrobox.com',
     'momerybox.com', 'teraboxapp.com', '1024tera.com',
     'terabox.app', 'gibibox.com', 'goaibox.com', 'terasharelink.com',
-    'teraboxlink.com', 'terafileshare.com', 'terafileshare.net'
+    'teraboxlink.com', 'terafileshare.com'
 ]
+
+VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".flv"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".ogg", ".flac"}
 
 last_update_time = 0
 
-# ---------- helper: membership ----------
-async def is_user_member(client, user_id):
+
+async def is_user_member(client: Client, user_id: int) -> bool:
     try:
         member = await client.get_chat_member(FSUB_ID, user_id)
-        if member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]:
-            return True
-        else:
-            return False
+        return member.status in {
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER
+        }
     except Exception as e:
-        logging.error(f"Error checking membership status for user {user_id}: {e}")
+        logger.error(f"Error checking membership status for user {user_id}: {e}")
         return False
 
-def is_valid_url(url):
+
+def is_valid_url(url: str) -> bool:
     parsed_url = urlparse(url)
     return any(parsed_url.netloc.endswith(domain) for domain in VALID_DOMAINS)
 
-def format_size(size):
+
+def format_size(size: int) -> str:
     if size < 1024:
         return f"{size} B"
     elif size < 1024 * 1024:
@@ -145,51 +159,158 @@ def format_size(size):
     else:
         return f"{size / (1024 * 1024 * 1024):.2f} GB"
 
-# ---------- uploader helper ----------
-async def safe_send_to_dump_and_forward(bot: Client, target_chat_id, user_chat_id, file_path, caption, progress_cb=None):
-    """
-    1) Try sending to dump channel (DUMP_CHAT_ID) using bot.
-    2) If that fails (CHANNEL_INVALID, etc), send directly to user's chat using bot.
-    """
-    # Step 1: send to dump
+
+async def update_status_message(status_message: Message, text: str):
     try:
-        sent = await bot.send_video(
-            target_chat_id,
+        await status_message.edit_text(text)
+    except BadRequest as e:
+        if "MESSAGE_NOT_MODIFIED" in str(e):
+            # ignore, no change
+            return
+        logger.error(f"Failed to update status message: {e}")
+    except Exception as e:
+        logger.error(f"Failed to update status message: {e}")
+
+
+def iterate_urls_in_json(obj):
+    """Recursively yield all HTTP(S) URLs found in JSON-like data."""
+    if isinstance(obj, str):
+        if obj.startswith("http://") or obj.startswith("https://"):
+            yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from iterate_urls_in_json(v)
+    elif isinstance(obj, (list, tuple, set)):
+        for v in obj:
+            yield from iterate_urls_in_json(v)
+
+
+def pick_media_url_from_api(data) -> str | None:
+    """
+    Try to pick a 'best' media URL from MiN3R/boogafantastic API JSON.
+    Strategy:
+      - Prefer URLs ending with video/audio extensions or m3u8.
+      - Otherwise, return first HTTP URL if nothing else.
+    """
+    candidates = list(iterate_urls_in_json(data))
+    if not candidates:
+        return None
+
+    # Strong match: obvious media extensions
+    def is_media(u: str) -> bool:
+        low = u.lower()
+        return (
+            any(low.split("?", 1)[0].endswith(ext) for ext in (
+                ".mp4", ".mkv", ".webm", ".mov", ".avi", ".flv",
+                ".mp3", ".m4a", ".wav", ".ogg", ".m3u8"
+            ))
+        )
+
+    media_candidates = [u for u in candidates if is_media(u)]
+    if media_candidates:
+        # Heuristic: choose the longest URL (often the fully signed one)
+        media_candidates.sort(key=len, reverse=True)
+        return media_candidates[0]
+
+    # Fallback: just return the first URL
+    return candidates[0]
+
+
+def get_direct_media_url(share_url: str) -> str:
+    """
+    Call the TERA_API JSON endpoint and extract a direct media URL.
+    Raises ValueError if it cannot find anything usable.
+    """
+    encoded = urllib.parse.quote(share_url, safe="")
+    api_url = f"{TERA_API}/api?url={encoded}"
+    logger.info(f"[API] Calling {api_url}")
+
+    try:
+        resp = requests.get(api_url, timeout=60)
+    except Exception as e:
+        raise ValueError(f"Failed to call Terabox API: {e}")
+
+    content_type = resp.headers.get("content-type", "")
+
+    # Prefer JSON
+    data = None
+    if "application/json" in content_type.lower():
+        try:
+            data = resp.json()
+        except Exception as e:
+            raise ValueError(f"API returned invalid JSON: {e}")
+    else:
+        # Try to parse JSON even if content-type is text/html (MiN3R 'raw' mode etc)
+        text = resp.text.strip()
+        if text.startswith("{") or text.startswith("["):
+            try:
+                data = json.loads(text)
+            except Exception as e:
+                logger.warning(f"Failed to parse JSON from HTML content-type: {e}")
+                data = None
+
+    if data is not None:
+        media_url = pick_media_url_from_api(data)
+        if media_url:
+            logger.info(f"[API] Picked media URL: {media_url}")
+            return media_url
+
+    # If still nothing, last-resort: try to scrape HTML for a media link
+    html = resp.text
+    m = re.search(
+        r'(https?://[^\s"\'<>]+\.(?:mp4|mkv|webm|mov|avi|flv|mp3|m4a|wav|ogg|m3u8)[^\s"\'<>]*)',
+        html
+    )
+    if m:
+        media_url = m.group(1)
+        logger.info(f"[API-HTML] Fallback media URL: {media_url}")
+        return media_url
+
+    # Nothing usable
+    raise ValueError("API did not return any usable media URL (maybe only images or unsupported file)")
+
+
+async def send_media(client: Client, chat_id: int, file_path: str, caption: str, progress=None) -> Message:
+    """
+    Send file to Telegram choosing the best method (video/photo/document)
+    based on file extension.
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+
+    if ext in IMAGE_EXTS:
+        return await client.send_photo(
+            chat_id,
             file_path,
             caption=caption,
-            progress=progress_cb
+            progress=progress
         )
-        # Try to forward/copy to user chat
-        try:
-            await bot.send_video(user_chat_id, sent.video.file_id, caption=caption)
-        except Exception as e:
-            logger.warning(f"Could not forward from dump to user: {e}")
-            try:
-                await bot.send_video(user_chat_id, file_path, caption=caption, progress=progress_cb)
-            except Exception as e2:
-                logger.error(f"Fallback sending direct to user failed: {e2}")
-        return True
+    elif ext in VIDEO_EXTS:
+        return await client.send_video(
+            chat_id,
+            file_path,
+            caption=caption,
+            supports_streaming=True,
+            progress=progress
+        )
+    elif ext in AUDIO_EXTS:
+        return await client.send_audio(
+            chat_id,
+            file_path,
+            caption=caption,
+            progress=progress
+        )
+    else:
+        return await client.send_document(
+            chat_id,
+            file_path,
+            caption=caption,
+            progress=progress
+        )
 
-    except BadRequest as e:
-        logger.error(f"BadRequest while sending to dump chat {target_chat_id}: {e}")
-        # Step 2: fallback direct to user
-        try:
-            await bot.send_video(user_chat_id, file_path, caption=caption, progress=progress_cb)
-            return False
-        except Exception as e2:
-            logger.error(f"Fallback direct send failed: {e2}")
-            raise
 
-    except RPCError as e:
-        logger.error(f"RPCError while sending to dump chat {target_chat_id}: {e}")
-        try:
-            await bot.send_video(user_chat_id, file_path, caption=caption, progress=progress_cb)
-            return False
-        except Exception as e2:
-            logger.error(f"Fallback direct send failed: {e2}")
-            raise
-
-# ---------- bot commands ----------
+# --------------------
+# /start command
+# --------------------
 @app.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
     join_button = InlineKeyboardButton("ᴊᴏɪɴ ❤️🚀", url="https://t.me/jetmirror")
@@ -197,29 +318,29 @@ async def start_command(client: Client, message: Message):
     repo69 = InlineKeyboardButton("ʀᴇᴘᴏ 🌐", url="https://github.com/Hrishi2861/Terabox-Downloader-Bot")
     user_mention = message.from_user.mention
     reply_markup = InlineKeyboardMarkup([[join_button, developer_button], [repo69]])
+
     final_msg = (
         f"ᴡᴇʟᴄᴏᴍᴇ, {user_mention}.\n\n"
-        "🌟 ɪ ᴀᴍ ᴀ ᴛᴇʀᴀʙᴏx ᴅᴏᴡɴʟᴏᴀᴅᴇʀ ʙᴏᴛ. "
-        "sᴇɴᴅ ᴍᴇ ᴀɴʏ ᴛᴇʀᴀʙᴏx ʟɪɴᴋ ɪ ᴡɪʟʟ ᴅᴏᴡɴʟᴏᴀᴅ ᴡɪᴛʜɪɴ ғᴇᴡ sᴇᴄᴏɴᴅs ᴀɴᴅ sᴇɴᴅ ɪᴛ ᴛᴏ ʏᴏᴜ ✨."
+        f"🌟 ɪ ᴀᴍ ᴀ ᴛᴇʀᴀʙᴏx ᴅᴏᴡɴʟᴏᴀᴅᴇʀ ʙᴏᴛ.\n"
+        f"sᴇɴᴅ ᴍᴇ ᴀɴʏ ᴛᴇʀᴀʙᴏx ʟɪɴᴋ ᴀɴᴅ ɪ ᴡɪʟʟ ᴅᴏᴡɴʟᴏᴀᴅ "
+        f"ɪᴛ ғᴏʀ ʏᴏᴜ ✨."
     )
-    video_file_id = "/app/Jet-Mirror.mp4"
-    if os.path.exists(video_file_id):
+    video_file_path = "/app/Jet-Mirror.mp4"
+
+    if os.path.exists(video_file_path):
         await client.send_video(
             chat_id=message.chat.id,
-            video=video_file_id,
+            video=video_file_path,
             caption=final_msg,
             reply_markup=reply_markup
         )
     else:
         await message.reply_text(final_msg, reply_markup=reply_markup)
 
-async def update_status_message(status_message, text):
-    try:
-        await status_message.edit_text(text)
-    except Exception as e:
-        logger.error(f"Failed to update status message: {e}")
 
-# ---------- main handler ----------
+# --------------------
+# Main handler
+# --------------------
 @app.on_message(filters.text)
 async def handle_message(client: Client, message: Message):
     if message.text.startswith('/'):
@@ -236,6 +357,7 @@ async def handle_message(client: Client, message: Message):
         await message.reply_text("ʏᴏᴜ ᴍᴜsᴛ ᴊᴏɪɴ ᴍʏ ᴄʜᴀɴɴᴇʟ ᴛᴏ ᴜsᴇ ᴍᴇ.", reply_markup=reply_markup)
         return
 
+    # Extract terabox URL from message
     url = None
     for word in message.text.split():
         if is_valid_url(word):
@@ -246,55 +368,51 @@ async def handle_message(client: Client, message: Message):
         await message.reply_text("Please provide a valid Terabox link.")
         return
 
-    encoded_url = urllib.parse.quote(url)
-    # Use configured TERA_API (boogafantastic) to wrap the link
-    final_url = f"{TERA_API}?url={encoded_url}"
-
+    # 1) Get direct media URL from API
     try:
-        download = aria2.add_uris([final_url])
+        media_url = get_direct_media_url(url)
     except Exception as e:
-        logger.error(f"aria2.add_uris failed: {e}")
-        return await message.reply_text(f"❌ Failed to start download: {e}")
+        logger.error(f"API error for {url}: {e}")
+        await message.reply_text(f"❌ API error:\n`{e}`")
+        return
+
+    # 2) Start aria2 download
+    try:
+        download = aria2.add_uris([media_url])
+    except Exception as e:
+        logger.error(f"Failed to queue aria2 download: {e}")
+        await message.reply_text(f"❌ Failed to enqueue download:\n`{e}`")
+        return
 
     status_message = await message.reply_text("sᴇɴᴅɪɴɢ ʏᴏᴜ ᴛʜᴇ ᴍᴇᴅɪᴀ...🤤")
-
     start_time = datetime.now()
 
-    while not download.is_complete:
-        await asyncio.sleep(7)
+    while not download.is_complete and not download.is_removed and not download.has_error:
+        await asyncio.sleep(15)
         try:
             download.update()
         except Exception as e:
-            logger.warning(f"Failed to update aria2 download object: {e}")
+            logger.error(f"aria2 update error: {e}")
+            break
 
-        progress = getattr(download, "progress", 0.0)
-        completed = getattr(download, "completed_length", 0)
-        total = getattr(download, "total_length", 0)
-        speed = getattr(download, "download_speed", 0)
-        filename = getattr(download, "name", "") or ""
-
-        if not filename:
-            try:
-                if download.files and len(download.files) > 0:
-                    filename = os.path.basename(download.files[0].path or "") or ""
-            except Exception:
-                filename = ""
+        progress = download.progress or 0
+        total = download.total_length or 0
+        done = download.completed_length or 0
 
         elapsed_time = datetime.now() - start_time
         elapsed_minutes, elapsed_seconds = divmod(elapsed_time.seconds, 60)
-        try:
-            eta = download.eta
-        except Exception:
-            eta = "unknown"
+
+        bar_filled = int(progress / 10) if progress <= 100 else 10
+        bar = '★' * bar_filled + '☆' * (10 - bar_filled)
 
         status_text = (
-            f"┏ ғɪʟᴇɴᴀᴍᴇ: {filename}\n"
-            f"┠ [{'★' * int(progress / 10)}{'☆' * (10 - int(progress / 10))}] {progress:.2f}%\n"
-            f"┠ ᴘʀᴏᴄᴇssᴇᴅ: {format_size(int(completed))} ᴏғ {format_size(int(total))}\n"
+            f"┏ ғɪʟᴇɴᴀᴍᴇ: {download.name or 'Unknown'}\n"
+            f"┠ [{bar}] {progress:.2f}%\n"
+            f"┠ ᴘʀᴏᴄᴇssᴇᴅ: {format_size(done)} ᴏғ {format_size(total)}\n"
             f"┠ sᴛᴀᴛᴜs: 📥 Downloading\n"
-            f"┠ ᴇɴɢɪɴᴇ: <b><u>Aria2c</u></b>\n"
-            f"┠ sᴘᴇᴇᴅ: {format_size(int(speed))}/s\n"
-            f"┠ ᴇᴛᴀ: {eta} | ᴇʟᴀᴘsᴇᴅ: {elapsed_minutes}m {elapsed_seconds}s\n"
+            f"┠ ᴇɴɢɪɴᴇ: <b><u>Aria2c v1.37.0</u></b>\n"
+            f"┠ sᴘᴇᴇᴅ: {format_size(download.download_speed)}/s\n"
+            f"┠ ᴇᴛᴀ: {download.eta} | ᴇʟᴀᴘsᴇᴅ: {elapsed_minutes}m {elapsed_seconds}s\n"
             f"┖ ᴜsᴇʀ: <a href='tg://user?id={user_id}'>{message.from_user.first_name}</a> | ɪᴅ: {user_id}\n"
         )
 
@@ -305,129 +423,251 @@ async def handle_message(client: Client, message: Message):
             except FloodWait as e:
                 logger.error(f"Flood wait detected! Sleeping for {e.value} seconds")
                 await asyncio.sleep(e.value)
-            except Exception as e:
-                logger.warning(f"Could not edit status message: {e}")
-                break
 
-        # safety: break if file exists even if aria2 metadata is weird
-        try:
-            if download.is_complete:
-                break
-            if int(total or 0) == 0:
-                if download.files and len(download.files) > 0:
-                    fpath_check = download.files[0].path
-                    if fpath_check and os.path.exists(fpath_check) and os.path.getsize(fpath_check) > 0:
-                        logger.info("Detected file even though total_length==0; going to upload.")
-                        break
-        except Exception:
-            pass
+    if download.is_error:
+        await status_message.edit_text("❌ Download failed from API / aria2.")
+        return
 
-    # get file path
-    try:
-        fpath = None
-        if download.files and len(download.files) > 0:
-            fpath = download.files[0].path
-        if not fpath and download.name:
-            fpath = os.path.join(os.getcwd(), download.name)
-        if not fpath or not os.path.exists(fpath):
-            await status_message.edit_text("❌ Download finished but file not found or empty.")
-            return
-    except Exception as e:
-        logger.error(f"Error getting download file path: {e}")
-        return await status_message.edit_text(f"❌ Error retrieving downloaded file: {e}")
+    if not download.is_complete:
+        await status_message.edit_text("❌ Download aborted.")
+        return
 
-    fname = os.path.basename(fpath)
-    fsize = os.path.getsize(fpath)
+    file_path = download.files[0].path
     caption = (
-        f"✨ {fname}\n"
+        f"✨ {download.name}\n"
         f"👤 ʟᴇᴇᴄʜᴇᴅ ʙʏ : <a href='tg://user?id={user_id}'>{message.from_user.first_name}</a>\n"
         f"📥 ᴜsᴇʀ ʟɪɴᴋ: tg://user?id={user_id}\n\n"
         "[ᴘᴏᴡᴇʀᴇᴅ ʙʏ ᴊᴇᴛ-ᴍɪʀʀᴏʀ ❤️🚀](https://t.me/JetMirror)"
     )
 
+    last_update_time = time.time()
+    UPDATE_INTERVAL = 15
+
+    async def update_status(msg: Message, text: str):
+        nonlocal last_update_time
+        current_time = time.time()
+        if current_time - last_update_time >= UPDATE_INTERVAL:
+            try:
+                await msg.edit_text(text)
+                last_update_time = current_time
+            except FloodWait as e:
+                logger.warning(f"FloodWait: Sleeping for {e.value}s")
+                await asyncio.sleep(e.value)
+                await update_status(msg, text)
+            except Exception as e:
+                if "MESSAGE_NOT_MODIFIED" not in str(e):
+                    logger.error(f"Error updating status: {e}")
+
     async def upload_progress(current, total):
-        progress = (current / total) * 100 if total > 0 else 0
+        progress = (current / total) * 100 if total else 0
         elapsed_time = datetime.now() - start_time
         elapsed_minutes, elapsed_seconds = divmod(elapsed_time.seconds, 60)
+
         status_text = (
-            f"┏ ғɪʟᴇɴᴀᴍᴇ: {fname}\n"
+            f"┏ ғɪʟᴇɴᴀᴍᴇ: {download.name}\n"
             f"┠ [{'★' * int(progress / 10)}{'☆' * (10 - int(progress / 10))}] {progress:.2f}%\n"
-            f"┠ ᴘʀᴏᴄᴇssᴇᴅ: {format_size(int(current))} ᴏғ {format_size(int(total))}\n"
+            f"┠ ᴘʀᴏᴄᴇssᴇᴅ: {format_size(current)} ᴏғ {format_size(total)}\n"
             f"┠ sᴛᴀᴛᴜs: 📤 Uploading to Telegram\n"
-            f"┠ ᴇɴɢɪɴᴇ: <b><u>Pyrogram</u></b>\n"
+            f"┠ ᴇɴɢɪɴᴇ: <b><u>PyroFork v2.2.11</u></b>\n"
             f"┠ ᴇʟᴀᴘsᴇᴅ: {elapsed_minutes}m {elapsed_seconds}s\n"
+            f"┖ ᴜsᴇʀ: <a href='tg://user?id={user_id}'>{message.from_user.first_name}</a> | ɪᴅ: {user_id}\n"
         )
+        await update_status(status_message, status_text)
+
+    async def split_video_with_ffmpeg(input_path, output_prefix, split_size):
         try:
-            await update_status_message(status_message, status_text)
+            original_ext = os.path.splitext(input_path)[1].lower() or '.mp4'
+            start_time_ff = datetime.now()
+            last_progress_update = time.time()
+
+            proc = await asyncio.create_subprocess_exec(
+                'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1', input_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            total_duration = float(stdout.decode().strip() or "0")
+
+            file_size = os.path.getsize(input_path)
+            parts = math.ceil(file_size / split_size)
+
+            if parts <= 1 or total_duration <= 0:
+                return [input_path]
+
+            duration_per_part = total_duration / parts
+            split_files = []
+
+            for i in range(parts):
+                current_time_ff = time.time()
+                if current_time_ff - last_progress_update >= UPDATE_INTERVAL:
+                    elapsed = datetime.now() - start_time_ff
+                    status_text_ff = (
+                        f"✂️ Splitting {os.path.basename(input_path)}\n"
+                        f"Part {i+1}/{parts}\n"
+                        f"Elapsed: {elapsed.seconds // 60}m {elapsed.seconds % 60}s"
+                    )
+                    await update_status(status_message, status_text_ff)
+                    last_progress_update = current_time_ff
+
+                output_path = f"{output_prefix}.{i+1:03d}{original_ext}"
+                cmd = [
+                    'xtra', '-y', '-ss', str(i * duration_per_part),
+                    '-i', input_path, '-t', str(duration_per_part),
+                    '-c', 'copy', '-map', '0',
+                    '-avoid_negative_ts', 'make_zero',
+                    output_path
+                ]
+
+                proc = await asyncio.create_subprocess_exec(*cmd)
+                await proc.wait()
+                split_files.append(output_path)
+
+            return split_files
         except Exception as e:
-            logger.debug(f"Could not update upload status: {e}")
+            logger.error(f"Split error: {e}")
+            raise
 
     async def handle_upload():
-        try:
-            file_size = os.path.getsize(fpath)
-        except Exception as e:
-            logger.error(f"Could not stat file before upload: {e}")
-            await status_message.edit_text("❌ Internal error: cannot read downloaded file.")
-            return
+        file_size = os.path.getsize(file_path)
 
-        # For now, ignore splitting and just upload whole file
-        try:
-            await update_status_message(status_message, f"📤 Uploading {fname} ({format_size(file_size)})")
-            sent_via_dump = await safe_send_to_dump_and_forward(
-                app, DUMP_CHAT_ID, message.chat.id, fpath, caption, progress_cb=upload_progress
+        sender_client = user if USER_SESSION_STRING else app
+
+        # Split if file too large
+        if file_size > SPLIT_SIZE:
+            await update_status(
+                status_message,
+                f"✂️ Splitting {download.name} ({format_size(file_size)})"
             )
-            if sent_via_dump:
-                await status_message.edit_text("✅ Uploaded to dump channel and delivered to you.")
-            else:
-                await status_message.edit_text("✅ Uploaded directly to you (dump channel unavailable).")
-        except Exception as e:
-            logger.error(f"Upload failed: {e}")
-            await status_message.edit_text(f"❌ Upload failed: {e}")
 
-        try:
-            if os.path.exists(fpath):
-                os.remove(fpath)
-        except Exception as e:
-            logger.warning(f"Could not remove file after upload: {e}")
+            split_files = await split_video_with_ffmpeg(
+                file_path,
+                os.path.splitext(file_path)[0],
+                SPLIT_SIZE
+            )
+
+            try:
+                for i, part in enumerate(split_files):
+                    part_caption = f"{caption}\n\nPart {i+1}/{len(split_files)}"
+                    await update_status(
+                        status_message,
+                        f"📤 Uploading part {i+1}/{len(split_files)}\n"
+                        f"{os.path.basename(part)}"
+                    )
+
+                    sent = await send_media(
+                        sender_client,
+                        DUMP_CHAT_ID,
+                        part,
+                        part_caption,
+                        progress=upload_progress
+                    )
+
+                    try:
+                        await app.copy_message(
+                            message.chat.id,
+                            DUMP_CHAT_ID,
+                            sent.id
+                        )
+                    except Exception as e:
+                        logger.error(f"Could not copy part {i+1} to user: {e}")
+
+                    try:
+                        os.remove(part)
+                    except Exception:
+                        pass
+            finally:
+                for part in split_files:
+                    try:
+                        if os.path.exists(part):
+                            os.remove(part)
+                    except Exception:
+                        pass
+        else:
+            await update_status(
+                status_message,
+                f"📤 Uploading {download.name}\n"
+                f"Size: {format_size(file_size)}"
+            )
+
+            sent = await send_media(
+                sender_client,
+                DUMP_CHAT_ID,
+                file_path,
+                caption,
+                progress=upload_progress
+            )
+
+            try:
+                await app.copy_message(
+                    message.chat.id,
+                    DUMP_CHAT_ID,
+                    sent.id
+                )
+            except Exception as e:
+                logger.error(f"Could not copy file to user: {e}")
+
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
 
     await handle_upload()
 
     try:
         await status_message.delete()
+    except Exception as e:
+        logger.error(f"Cleanup status message error: {e}")
+    try:
         await message.delete()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Cleanup user message error: {e}")
 
-# ---------- simple web keepalive ----------
+
+# --------------------
+# Flask keep-alive
+# --------------------
 flask_app = Flask(__name__)
+
 
 @flask_app.route('/')
 def home():
-    return render_template("index.html") if os.path.exists("templates/index.html") else "OK"
+    return render_template("index.html")
+
 
 def run_flask():
     flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 
-def keep_alive():
-    Thread(target=run_flask).start()
 
+def keep_alive():
+    Thread(target=run_flask, daemon=True).start()
+
+
+# --------------------
+# User client helper
+# --------------------
 async def start_user_client():
-    # we are not using user client for now, but keep hook in case you enable it later
     if user:
         await user.start()
         logger.info("User client started.")
+
 
 def run_user():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(start_user_client())
 
+
+# --------------------
+# Main entry
+# --------------------
 if __name__ == "__main__":
     keep_alive()
 
     if user:
         logger.info("Starting user client...")
-        Thread(target=run_user).start()
+        Thread(target=run_user, daemon=True).start()
 
     logger.info("Starting bot client...")
     app.run()
