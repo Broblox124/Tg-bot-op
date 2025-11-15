@@ -235,7 +235,7 @@ def pick_media_url_from_api(data: dict, original_url: str) -> str:
 
     scan(data)
 
-    # De-duplicate & pick longest
+    # De-duplicate & pick best
     unique = []
     for c in candidates:
         if c not in unique:
@@ -324,11 +324,15 @@ async def start_command(client: Client, message: Message):
 
 
 # -------------------------------------------------
-# Main handler
+# Main handler (all non-command text in private)
 # -------------------------------------------------
-@app.on_message(filters.private & filters.text & ~filters.command)
+@app.on_message(filters.private & filters.text)
 async def handle_message(client: Client, message: Message):
     if not message.from_user:
+        return
+
+    # ignore commands here (we already have /start handler)
+    if message.text.startswith("/"):
         return
 
     user_id = message.from_user.id
